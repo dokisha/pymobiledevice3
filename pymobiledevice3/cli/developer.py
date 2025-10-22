@@ -393,6 +393,60 @@ def sysmon_process_single(service_provider: LockdownClient, attributes: list[str
     print_json(result)
 
 
+@sysmon_process.command('monitor-single', cls=Command)
+@click.option('-a', '--attributes', multiple=True,
+              help='filter processes by given attribute value given as key=value')
+@click.option('-o', '--output', type=click.Path(), default=None,
+              help='output file path for JSONL format (optional, defaults to stdout)')
+def sysmon_process_monitor_single(service_provider: LockdownClient, attributes: list[str], output: Optional[str]):
+    """ continuously monitor a single process with comprehensive metrics. """
+
+    count = 0
+    output_file = None
+
+    try:
+        if output:
+            output_file = open(output, 'w')
+
+        with DvtSecureSocketProxyService(lockdown=service_provider) as dvt:
+            device_info = DeviceInfo(dvt)
+
+            with Sysmontap(dvt) as sysmon:
+                for process_snapshot in sysmon.iter_processes():
+                    count += 1
+
+                    if count < 2:
+                        # first sample doesn't contain an initialized value for cpuUsage
+                        continue
+
+                    for process in process_snapshot:
+                        skip = False
+                        if attributes is not None:
+                            for filter_attr in attributes:
+                                filter_attr, filter_value = filter_attr.split('=')
+                                if str(process[filter_attr]) != filter_value:
+                                    skip = True
+                                    break
+
+                        if skip:
+                            continue
+
+                        # adding "artificially" the execName field
+                        process['execName'] = device_info.execname_for_pid(process['pid'])
+
+                        json_output = json.dumps(process, default=default_json_encoder)
+
+                        if output_file:
+                            output_file.write(json_output + '\n')
+                            output_file.flush()
+                        else:
+                            print(json_output, flush=True)
+
+    finally:
+        if output_file:
+            output_file.close()
+
+
 @sysmon.command('system', cls=Command)
 @click.option('-f', '--fields', help='field names splitted by ",".')
 def sysmon_system(service_provider: LockdownClient, fields):
