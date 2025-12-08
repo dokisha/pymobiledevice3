@@ -2,14 +2,16 @@ import asyncio
 import logging
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from asyncio import CancelledError
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from functools import update_wrapper
-from typing import Optional
+from typing import Optional, Union
 
 import click
 import inquirer3
 import IPython
+import nest_asyncio
 import uvicorn
 from inquirer3.themes import GreenPassion
 from prompt_toolkit import HTML, PromptSession
@@ -24,8 +26,13 @@ from pygments.styles import get_style_by_name
 
 from pymobiledevice3.cli.cli_common import Command
 from pymobiledevice3.common import get_home_folder
-from pymobiledevice3.exceptions import InspectorEvaluateError, LaunchingApplicationError, \
-    RemoteAutomationNotEnabledError, WebInspectorNotEnabledError, WirError
+from pymobiledevice3.exceptions import (
+    InspectorEvaluateError,
+    LaunchingApplicationError,
+    RemoteAutomationNotEnabledError,
+    WebInspectorNotEnabledError,
+    WirError,
+)
 from pymobiledevice3.lockdown import LockdownClient, create_using_usbmux
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.osu.os_utils import get_os_utils
@@ -34,7 +41,7 @@ from pymobiledevice3.services.web_protocol.driver import By, Cookie, WebDriver
 from pymobiledevice3.services.web_protocol.inspector_session import InspectorSession
 from pymobiledevice3.services.webinspector import SAFARI, ApplicationPage, WebinspectorService
 
-SCRIPT = '''
+SCRIPT = """
 function inspectedPage_evalResult_getCompletions(primitiveType) {{
     var resultSet={{}};
     var object = primitiveType;
@@ -52,15 +59,74 @@ function inspectedPage_evalResult_getCompletions(primitiveType) {{
 try {{
     inspectedPage_evalResult_getCompletions({object})
 }} catch (e) {{}}
-'''
+"""
 
-JS_RESERVED_WORDS = ['abstract', 'arguments', 'await', 'boolean', 'break', 'byte', 'case', 'catch', 'char', 'class',
-                     'const', 'continue', 'debugger', 'default', 'delete', 'do', 'double', 'else', 'enum', 'eval',
-                     'export', 'extends', 'false', 'final', 'finally', 'float', 'for', 'function', 'goto', 'if',
-                     'implements', 'import', 'in', 'instanceof', 'int', 'interface', 'let', 'long', 'native', 'new',
-                     'null', 'package', 'private', 'protected', 'public', 'return', 'short', 'static', 'super',
-                     'switch', 'synchronized', 'this', 'throw', 'throws', 'transient', 'true', 'try', 'typeof', 'var',
-                     'void', 'volatile', 'while', 'with', 'yield', ]
+JS_RESERVED_WORDS = [
+    "abstract",
+    "arguments",
+    "await",
+    "boolean",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "eval",
+    "export",
+    "extends",
+    "false",
+    "final",
+    "finally",
+    "float",
+    "for",
+    "function",
+    "goto",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "instanceof",
+    "int",
+    "interface",
+    "let",
+    "long",
+    "native",
+    "new",
+    "null",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "short",
+    "static",
+    "super",
+    "switch",
+    "synchronized",
+    "this",
+    "throw",
+    "throws",
+    "transient",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "volatile",
+    "while",
+    "with",
+    "yield",
+]
 
 OSUTILS = get_os_utils()
 logger = logging.getLogger(__name__)
@@ -73,7 +139,7 @@ def cli() -> None:
 
 @cli.group()
 def webinspector() -> None:
-    """ Access webinspector services """
+    """Access webinspector services"""
     pass
 
 
@@ -82,11 +148,11 @@ def catch_errors(func):
         try:
             return func(*args, **kwargs)
         except LaunchingApplicationError:
-            logger.error('Unable to launch application (try to unlock device)')
+            logger.error("Unable to launch application (try to unlock device)")
         except WebInspectorNotEnabledError:
-            logger.error('Web inspector is not enable')
+            logger.error("Web inspector is not enable")
         except RemoteAutomationNotEnabledError:
-            logger.error('Remote automation is not enable')
+            logger.error("Remote automation is not enable")
 
     return update_wrapper(catch_function, func)
 
@@ -97,15 +163,24 @@ def reload_pages(inspector: WebinspectorService):
     inspector.flush_input(2)
 
 
-def create_webinspector_and_launch_app(lockdown: LockdownClient, timeout: float, app: str):
+async def create_webinspector_and_launch_app(lockdown: LockdownClient, timeout: float, app: str):
     inspector = WebinspectorService(lockdown=lockdown)
-    inspector.connect(timeout)
-    application = inspector.open_app(app)
+    await inspector.connect(timeout)
+    application = await inspector.open_app(app)
     return inspector, application
 
 
+async def opened_tabs_task(service_provider: LockdownClient, timeout):
+    inspector = WebinspectorService(lockdown=service_provider)
+    await inspector.connect(timeout)
+    application_pages = await inspector.get_open_application_pages(timeout=timeout)
+    for application_page in application_pages:
+        print(application_page)
+    await inspector.close()
+
+
 @webinspector.command(cls=Command)
-@click.option('-t', '--timeout', default=3, show_default=True, type=float)
+@click.option("-t", "--timeout", default=3, show_default=True, type=float)
 @catch_errors
 def opened_tabs(service_provider: LockdownClient, timeout):
     """
@@ -117,17 +192,26 @@ def opened_tabs(service_provider: LockdownClient, timeout):
 
        iOS < 18: Settings -> Safari -> Advanced -> Web Inspector
     """
-    inspector = WebinspectorService(lockdown=service_provider)
-    inspector.connect(timeout)
-    application_pages = inspector.get_open_application_pages(timeout=timeout)
-    for application_page in application_pages:
-        print(application_page)
-    inspector.close()
+    asyncio.run(opened_tabs_task(service_provider, timeout), debug=True)
+
+
+@catch_errors
+async def launch_task(service_provider: LockdownClient, url, timeout):
+    inspector, safari = await create_webinspector_and_launch_app(service_provider, timeout, SAFARI)
+    session = await inspector.automation_session(safari)
+    driver = WebDriver(session)
+    print("Starting session")
+    await driver.start_session()
+    print("Getting URL")
+    await driver.get(url)
+    OSUTILS.wait_return()
+    await session.stop_session()
+    await inspector.close()
 
 
 @webinspector.command(cls=Command)
-@click.argument('url')
-@click.option('-t', '--timeout', default=3, show_default=True, type=float)
+@click.argument("url")
+@click.option("-t", "--timeout", default=3, show_default=True, type=float)
 @catch_errors
 def launch(service_provider: LockdownClient, url, timeout):
     """
@@ -143,19 +227,10 @@ def launch(service_provider: LockdownClient, url, timeout):
         Settings -> Safari -> Advanced -> Remote Automation
 
     """
-    inspector, safari = create_webinspector_and_launch_app(service_provider, timeout, SAFARI)
-    session = inspector.automation_session(safari)
-    driver = WebDriver(session)
-    print('Starting session')
-    driver.start_session()
-    print('Getting URL')
-    driver.get(url)
-    OSUTILS.wait_return()
-    session.stop_session()
-    inspector.close()
+    asyncio.run(launch_task(service_provider, url, timeout), debug=True)
 
 
-SHELL_USAGE = '''
+SHELL_USAGE = """
 # This shell allows you to control the web with selenium like API.
 # The first thing you should do is creating a session:
 driver.start_session()
@@ -173,12 +248,31 @@ driver.add_cookie(
 )
 
 # See selenium api for more features.
-'''
+"""
+
+
+@catch_errors
+async def shell_task(service_provider: LockdownClient, timeout):
+    inspector, safari = await create_webinspector_and_launch_app(service_provider, timeout, SAFARI)
+    session = await inspector.automation_session(safari)
+    driver = WebDriver(session)
+    try:
+        nest_asyncio.apply()
+        IPython.embed(
+            header=highlight(SHELL_USAGE, lexers.PythonLexer(), formatters.Terminal256Formatter(style="native")),
+            user_ns={
+                "driver": driver,
+                "Cookie": Cookie,
+                "By": By,
+            },
+        )
+    finally:
+        await session.stop_session()
+        await inspector.close()
 
 
 @webinspector.command(cls=Command)
-@click.option('-t', '--timeout', default=3, show_default=True, type=float)
-@catch_errors
+@click.option("-t", "--timeout", default=3, show_default=True, type=float)
 def shell(service_provider: LockdownClient, timeout):
     """
     Create an IPython shell for interacting with a WebView.
@@ -192,30 +286,18 @@ def shell(service_provider: LockdownClient, timeout):
         Settings -> Safari -> Advanced -> Web Inspector
         Settings -> Safari -> Advanced -> Remote Automation
     """
-    inspector, safari = create_webinspector_and_launch_app(service_provider, timeout, SAFARI)
-    session = inspector.automation_session(safari)
-    driver = WebDriver(session)
-    try:
-        IPython.embed(
-            header=highlight(SHELL_USAGE, lexers.PythonLexer(), formatters.Terminal256Formatter(style='native')),
-            user_ns={
-                'driver': driver,
-                'Cookie': Cookie,
-                'By': By,
-            })
-    finally:
-        session.stop_session()
-        inspector.close()
+    asyncio.run(shell_task(service_provider, timeout), debug=True)
 
 
 @webinspector.command(cls=Command)
-@click.option('-t', '--timeout', default=3, show_default=True, type=float)
-@click.option('--automation', is_flag=True, help='Use remote automation')
-@click.option('--no-open-safari', is_flag=True, help='Avoid opening the Safari app')
-@click.argument('url', required=False, default='')
+@click.option("-t", "--timeout", default=3, show_default=True, type=float)
+@click.option("--automation", is_flag=True, help="Use remote automation")
+@click.option("--no-open-safari", is_flag=True, help="Avoid opening the Safari app")
+@click.argument("url", required=False, default="")
 @catch_errors
-def js_shell(service_provider: LockdownServiceProvider, timeout: float, automation: bool, no_open_safari: bool,
-             url: str) -> None:
+def js_shell(
+    service_provider: LockdownServiceProvider, timeout: float, automation: bool, no_open_safari: bool, url: str
+) -> None:
     """
     Create a javascript shell. This interpreter runs on your local machine,
     but evaluates each expression on the remote
@@ -234,7 +316,7 @@ def js_shell(service_provider: LockdownServiceProvider, timeout: float, automati
     asyncio.run(run_js_shell(js_shell_class, service_provider, timeout, url, not no_open_safari))
 
 
-udid = ''
+udid = ""
 
 
 def create_app():
@@ -244,8 +326,8 @@ def create_app():
 
 
 @webinspector.command(cls=Command)
-@click.option('--host', default='127.0.0.1')
-@click.option('--port', type=click.INT, default=9222)
+@click.option("--host", default="127.0.0.1")
+@click.option("--port", type=click.INT, default=9222)
 def cdp(service_provider: LockdownClient, host, port):
     """
     Start a CDP server for debugging WebViews.
@@ -256,56 +338,78 @@ def cdp(service_provider: LockdownClient, host, port):
     """
     global udid
     udid = service_provider.udid
-    uvicorn.run('pymobiledevice3.cli.webinspector:create_app', host=host, port=port, factory=True,
-                ws_ping_timeout=None, ws='wsproto', loop='asyncio')
+    uvicorn.run(
+        "pymobiledevice3.cli.webinspector:create_app",
+        host=host,
+        port=port,
+        factory=True,
+        ws_ping_timeout=None,
+        ws="wsproto",
+        loop="asyncio",
+    )
 
 
-def get_js_completions(jsshell: 'JsShell', obj: str, prefix: str) -> list[Completion]:
+async def get_js_completions(jsshell: "JsShell", obj: str, prefix: str) -> AsyncIterator[Completion]:
     if obj in JS_RESERVED_WORDS:
-        return []
+        return
 
-    completions = []
     try:
-        for key in asyncio.get_running_loop().run_until_complete(
-                jsshell.evaluate_expression(SCRIPT.format(object=obj), return_by_value=True)):
+        for key in await jsshell.evaluate_expression(SCRIPT.format(object=obj), return_by_value=True):
             if not key.startswith(prefix):
                 continue
-            completions.append(Completion(key.removeprefix(prefix), display=key))
-    except Exception:
+            yield Completion(key.removeprefix(prefix), display=key)
+    except (Exception, CancelledError):
         # ignore every possible exception
         pass
-    return completions
 
 
 class JsShellCompleter(Completer):
-    def __init__(self, jsshell: 'JsShell'):
+    def __init__(self, jsshell: "JsShell"):
         self.jsshell = jsshell
 
-    def get_completions(
-            self, document: Document, complete_event: CompleteEvent
-    ) -> Iterable[Completion]:
-        text = f'globalThis.{document.text_before_cursor}'
-        text = re.findall('[a-zA-Z_][a-zA-Z_0-9.]+', text)
-        if len(text) == 0:
-            return []
-        text = text[-1]
-        if '.' in text:
-            js_obj, prefix = text.rsplit('.', 1)
+    def get_completions_async(
+        self,
+        document: Document,
+        complete_event: CompleteEvent,
+    ) -> Union[AsyncIterator[Completion], Iterable[Completion]]:
+        # Build the JS expression we want to inspect
+        text = f"globalThis.{document.text_before_cursor}"
+
+        # Extract identifiers / dotted paths
+        matches = re.findall(r"[a-zA-Z_][a-zA-Z_0-9.]+", text)
+        if not matches:
+            # async *generator*: just end, don't return a list
+            return iter(())
+
+        text = matches[-1]
+        if "." in text:
+            js_obj, prefix = text.rsplit(".", 1)
         else:
             js_obj = text
-            prefix = ''
+            prefix = ""
 
+        # This should return an iterable of Completion (or something we can wrap)
         return get_js_completions(self.jsshell, js_obj, prefix)
+
+    # Optional: keep sync completions empty so PTK knows we prefer async
+    def get_completions(
+        self,
+        document: Document,
+        complete_event: CompleteEvent,
+    ) -> Iterable[Completion]:
+        return []
 
 
 class JsShell(ABC):
     def __init__(self) -> None:
         super().__init__()
-        self.prompt_session = PromptSession(lexer=PygmentsLexer(lexers.JavascriptLexer),
-                                            auto_suggest=AutoSuggestFromHistory(),
-                                            style=style_from_pygments_cls(get_style_by_name('stata-dark')),
-                                            history=FileHistory(self.webinspector_history_path()),
-                                            completer=JsShellCompleter(self))
+        self.prompt_session = PromptSession(
+            lexer=PygmentsLexer(lexers.JavascriptLexer),
+            auto_suggest=AutoSuggestFromHistory(),
+            style=style_from_pygments_cls(get_style_by_name("stata-dark")),
+            history=FileHistory(self.webinspector_history_path()),
+            completer=JsShellCompleter(self),
+        )
 
     @classmethod
     @abstractmethod
@@ -328,19 +432,18 @@ class JsShell(ABC):
             return
 
         result = await self.evaluate_expression(exp)
-        colorful_result = highlight(f'{result}', lexers.JavascriptLexer(),
-                                    formatters.Terminal256Formatter(style='stata-dark'))
-        print(colorful_result, end='')
+        colorful_result = highlight(
+            f"{result}", lexers.JavascriptLexer(), formatters.Terminal256Formatter(style="stata-dark")
+        )
+        print(colorful_result, end="")
 
-    async def start(self, url: str = ''):
+    async def start(self, url: str = ""):
         if url:
             await self.navigate(url)
         while True:
             try:
                 await self.js_iter()
-            except WirError as e:
-                logger.error(e)
-            except InspectorEvaluateError as e:
+            except (WirError, InspectorEvaluateError) as e:
                 logger.error(e)
             except KeyboardInterrupt:  # KeyboardInterrupt Control-C
                 pass
@@ -349,7 +452,7 @@ class JsShell(ABC):
 
     @staticmethod
     def webinspector_history_path() -> str:
-        return str(get_home_folder() / 'webinspector_history')
+        return str(get_home_folder() / "webinspector_history")
 
 
 class AutomationJsShell(JsShell):
@@ -359,11 +462,11 @@ class AutomationJsShell(JsShell):
 
     @classmethod
     @asynccontextmanager
-    async def create(cls, lockdown: LockdownClient, timeout: float, open_safari: bool) -> 'AutomationJsShell':
+    async def create(cls, lockdown: LockdownClient, timeout: float, open_safari: bool) -> "AutomationJsShell":
         inspector, application = create_webinspector_and_launch_app(lockdown, timeout, SAFARI)
         automation_session = inspector.automation_session(application)
         driver = WebDriver(automation_session)
-        driver.start_session()
+        await driver.start_session()
         try:
             yield cls(driver)
         finally:
@@ -371,10 +474,10 @@ class AutomationJsShell(JsShell):
             inspector.close()
 
     async def evaluate_expression(self, exp: str, return_by_value: bool = False):
-        return self.driver.execute_script(f'return {exp}')
+        return await self.driver.execute_script(f"return {exp}")
 
     async def navigate(self, url: str):
-        self.driver.get(url)
+        await self.driver.get(url)
 
 
 class InspectorJsShell(JsShell):
@@ -384,12 +487,12 @@ class InspectorJsShell(JsShell):
 
     @classmethod
     @asynccontextmanager
-    async def create(cls, lockdown: LockdownClient, timeout: float, open_safari: bool) -> 'InspectorJsShell':
+    async def create(cls, lockdown: LockdownClient, timeout: float, open_safari: bool) -> "InspectorJsShell":
         inspector = WebinspectorService(lockdown=lockdown)
-        inspector.connect(timeout)
+        await inspector.connect(timeout)
         if open_safari:
-            _ = inspector.open_app(SAFARI)
-        application_page = cls.query_page(inspector, bundle_identifier=SAFARI if open_safari else None)
+            _ = await inspector.open_app(SAFARI)
+        application_page = await cls.query_page(inspector, bundle_identifier=SAFARI if open_safari else None)
         if application_page is None:
             raise click.exceptions.Exit()
 
@@ -400,7 +503,7 @@ class InspectorJsShell(JsShell):
         try:
             yield cls(inspector_session)
         finally:
-            inspector.close()
+            await inspector.close()
 
     async def evaluate_expression(self, exp: str, return_by_value: bool = False):
         return await self.inspector_session.runtime_evaluate(exp, return_by_value=return_by_value)
@@ -409,22 +512,27 @@ class InspectorJsShell(JsShell):
         await self.inspector_session.navigate_to_url(url)
 
     @staticmethod
-    def query_page(inspector: WebinspectorService, bundle_identifier: Optional[str] = None) \
-            -> Optional[ApplicationPage]:
-        available_pages = inspector.get_open_application_pages(timeout=1)
+    async def query_page(
+        inspector: WebinspectorService, bundle_identifier: Optional[str] = None
+    ) -> Optional[ApplicationPage]:
+        available_pages = await inspector.get_open_application_pages(timeout=1)
         if bundle_identifier is not None:
-            available_pages = [application_page for application_page in available_pages if
-                               application_page.application.bundle == bundle_identifier]
+            available_pages = [
+                application_page
+                for application_page in available_pages
+                if application_page.application.bundle == bundle_identifier
+            ]
         if not available_pages:
-            logger.error('Unable to find available pages (try to unlock device)')
+            logger.error("Unable to find available pages (try to unlock device)")
             return None
 
-        page_query = [inquirer3.List('page', message='choose page', choices=available_pages, carousel=True)]
-        page = inquirer3.prompt(page_query, theme=GreenPassion(), raise_keyboard_interrupt=True)['page']
+        page_query = [inquirer3.List("page", message="choose page", choices=available_pages, carousel=True)]
+        page = inquirer3.prompt(page_query, theme=GreenPassion(), raise_keyboard_interrupt=True)["page"]
         return page
 
 
-async def run_js_shell(js_shell_class: type[JsShell], lockdown: LockdownServiceProvider,
-                       timeout: float, url: str, open_safari: bool) -> None:
+async def run_js_shell(
+    js_shell_class: type[JsShell], lockdown: LockdownServiceProvider, timeout: float, url: str, open_safari: bool
+) -> None:
     async with js_shell_class.create(lockdown, timeout, open_safari) as js_shell_instance:
         await js_shell_instance.start(url)
